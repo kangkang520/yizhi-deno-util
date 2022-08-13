@@ -1,0 +1,62 @@
+{
+	"https://auth.aliyundrive.com": [
+		{
+			"domain": ".aliyundrive.com",
+			"path": "/",
+			"expires": "2022-08-13 19:08:09",
+			"httpOnly": true,
+			"name": "SESSIONID",
+			"value": "80d931b23a7a4741bda0bc84e392ae7b"
+		}
+	],
+	"https://passport.aliyundrive.com": [
+		{
+			"domain": null,
+			"path": "/",
+			"expires": null,
+			"httpOnly": true,
+			"name": "XSRF-TOKEN",
+			"value": "e5ee0d05-4ef6-4f5c-b51a-920b5a36c0c2"
+		},
+		{
+			"domain": ".aliyundrive.com",
+			"path": "/",
+			"expires": null,
+			"httpOnly": true,
+			"name": "_samesite_flag_",
+			"value": "true"
+		},
+		{
+			"domain": ".aliyundrive.com",
+			"path": "/",
+			"expires": null,
+			"httpOnly": true,
+			"name": "cookie2",
+			"value": "194e3e23f5f659b2108f9b60f90fd697"
+		},
+		{
+			"domain": ".aliyundrive.com",
+			"path": "/",
+			"expires": "2022-11-11 00:37:57",
+			"httpOnly": false,
+			"name": "t",
+			"value": "c76c12b2a7914ecd13e257d6a2947ca9"
+		},
+		{
+			"domain": ".aliyundrive.com",
+			"path": "/",
+			"expires": null,
+			"httpOnly": false,
+			"name": "_tb_token_",
+			"value": "3930b73e6303"
+		},
+		{
+			"domain": ".aliyundrive.com",
+			"path": "/",
+			"expires": null,
+			"httpOnly": false,
+			"name": "csg",
+			"value": "b19149a0"
+		}
+	]
+}
