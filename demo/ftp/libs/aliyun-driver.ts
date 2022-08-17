@@ -1,17 +1,30 @@
 import * as path from 'https://deno.land/std@0.151.0/path/mod.ts'
 import { readerFromStreamReader, readAll } from "https://deno.land/std@0.93.0/io/mod.ts";
-import puppeteer from "https://deno.land/x/puppeteer@14.1.1/mod.ts"
+import puppeteer, { Protocol, ConsoleMessage, Browser, Page } from "https://deno.land/x/puppeteer@14.1.1/mod.ts"
 import 'https://deno.land/x/puppeteer@14.1.1/install.ts'
+import { EventEmitter } from '../../../ftp-server/emitter.ts';
 
-type Browser = Awaited<ReturnType<typeof puppeteer.launch>>
-type Page = Awaited<ReturnType<Browser['newPage']>>
 
 const ALI_URLS = {
 	urls: {
+		LOGIN: `https://www.aliyundrive.com/sign/in`,
+		LOGOUT: `https://www.aliyundrive.com/sign/out`,
 		HOME: `https://www.aliyundrive.com/drive`,
 		QRCODE_GEN: `https://passport.aliyundrive.com/newlogin/qrcode/generate.do`,
 		QRCODE_QUERY: `https://passport.aliyundrive.com/newlogin/qrcode/query.do`,
-		LOGOUT: `https://www.aliyundrive.com/sign/out`,
+		USER_INFO: `https://api.aliyundrive.com/adrive/v2/user/get`,
+	},
+	api: {
+		GET_RECYCLE_BIN: `https://api.aliyundrive.com/adrive/v2/recyclebin/list`,
+		CREATE_FOLDER: `https://api.aliyundrive.com/adrive/v2/file/createWithFolders`,
+		PRE_UPLOAD: `https://api.aliyundrive.com/adrive/v2/file/createWithFolders`,
+		GET_DOWNLOAD: `https://api.aliyundrive.com/v2/file/get_download_url`,
+		MOVE_TO_TRASH: `https://api.aliyundrive.com/v2/recyclebin/trash`,
+		DELETE_FILE: `https://api.aliyundrive.com/v3/batch`,
+		RENAME_FILE: `https://api.aliyundrive.com/v3/file/update`,
+		CLEAR_RECYCLE_BIN: `https://api.aliyundrive.com/v2/recyclebin/clear`,
+		GET_STORAGE_INFO: `https://api.aliyundrive.com/adrive/v1/user/driveCapacityDetails`,
+		LIST_FILES: `https://api.aliyundrive.com/adrive/v3/file/list`,
 	},
 	is(url: URL | null, key: keyof typeof this.urls) {
 		if (!url) return false
@@ -89,8 +102,14 @@ export enum QRCodeStatus {
 }
 
 interface IAliPanDriverOption {
-	/** 目录时间，单位:秒， 默认:60*5 */
+	/** 目录时间，单位(秒)， 默认 60*5 */
 	cacheTime?: number
+	/** 浏览器存储目录，默认 ${HOME}/.aliftp */
+	browserDataDir?: string
+	/** 浏览器的UserAgent */
+	userAgent?: string
+	/** 浏览器刷新时间间隔，单位(秒)，默认 10*60 */
+	refreshTimeout?: number
 }
 
 //获取秒数
@@ -98,7 +117,24 @@ function sec() {
 	return Date.now() / 1000
 }
 
-export class AliPanDriver {
+export class AliPanDriver extends EventEmitter<{
+	/** 页面或浏览器错误 */
+	error: (err: Error) => any
+	/** 页面就绪（已登录，并且网盘主界面已加载） */
+	ready: () => any
+	/** 页面数据改变 */
+	dataChanged: (data: {
+		localStorage: Record<string | number, string>
+		sessionStorage: Record<string | number, string>
+		cookies: Array<Protocol.Network.CookieParam>
+	}) => any
+	/** 开始加载页面 */
+	load: (url: string) => any
+	/** 登录状态改变 */
+	login: (isLogin: boolean) => any
+	/** 浏览器控制台输出 */
+	console: (msg: ConsoleMessage) => any
+}> {
 
 	#dirCache: { [P in string]: { id: string, time: number } } = {}
 	#lastData: { dir: string, files: Array<IAliFile> } | null = null
@@ -109,9 +145,14 @@ export class AliPanDriver {
 	#isLogin = false
 	#qrcode: { data: Uint8Array, status: QRCodeStatus } | null = null
 	#view: Uint8Array | null = null
+	#pageReady = false
+	#pageReadyFuncs: Array<() => any> = []
+
 	#option: IAliPanDriverOption
 
+
 	constructor(option?: IAliPanDriverOption) {
+		super()
 		this.#option = {
 			...option
 		}
@@ -119,10 +160,10 @@ export class AliPanDriver {
 
 	/** 初始化 */
 	public async init(): Promise<void> {
-		const home = Deno.env.get('HOME')!
+		const dataDir = this.#option.browserDataDir ? path.resolve(Deno.cwd(), this.#option.browserDataDir) : path.join(Deno.env.get('HOME')!, '.aliftp')
 		//读取，保存系统数据
 		const sysdata = (file: string, data?: any) => {
-			const filepath = path.join(home, '.aliftp', file + '.json')
+			const filepath = path.join(dataDir, file + '.json')
 			if (data === undefined) {
 				try {
 					return JSON.parse(Deno.readTextFileSync(filepath))
@@ -141,35 +182,41 @@ export class AliPanDriver {
 			// userDataDir: path.join(home, '.aliftp', 'ChromeData'),
 			defaultViewport: { width: 1920, height: 1080 },
 		});
-		browser.on('error', err => console.error(err))
+		browser.on('error', err => this.fire('error', err))
 
 		this.#page = await browser.newPage();
-		this.#page.on('error', err => console.error(err))
-		this.#page.on('console', e => console.log(`[Console] ${e.text()}`))
+		this.#page.setUserAgent(this.#option.userAgent || `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.5112.81 Safari/537.36`)
+		this.#page.on('error', err => this.fire('error', err))
+		this.#page.on('console', msg => this.fire('console', msg))
 
 		//定义一个函数用来保存storage和cookie
 		await this.#page.exposeFunction('saveStorage', (storage: { localStorage: any, sessionStorage: any }) => {
 			console.log('storage changed')
 			sysdata('local_storage', storage.localStorage)
 			sysdata('session_storage', storage.sessionStorage)
-			this.#page.cookies().then(cookies => sysdata('cookie', cookies))
+			this.#page.cookies().then(cookies => {
+				sysdata('cookie', cookies)
+				this.fire('dataChanged', { ...storage, cookies })
+			})
 		})
 
 		//恢复storage，同时定时报告storage信息
-		await this.#page.evaluateOnNewDocument(function (s: { localStorage: any, sessionStorage: any }) {
-			//设置localstorage和sessionstorage
-			Object.keys(s).forEach(storage => {
-				const data = (s as any)[storage]
-				if (!data) return
-				Object.keys(data).forEach(key => {
-					(window as any)[storage][key] = data[key]
-				})
-			})
+		await this.#page.evaluateOnNewDocument(function (storages: any, aliurls: any) {
+			const win = window as any
+			win.ALI_URLS = aliurls
 			//监听storage改变
 			window.addEventListener('storage', (e: any) => {
-				(window as any).saveStorage({ localStorage, sessionStorage })
+				win.saveStorage({ localStorage, sessionStorage })
 			})
-		}, { localStorage: sysdata('local_storage'), sessionStorage: sysdata('session_storage') })
+			//设置localstorage和sessionstorage
+			Object.keys(storages).forEach(storage => {
+				const data = (storages as any)[storage]
+				if (!data) return
+				Object.keys(data).forEach(key => {
+					win[storage][key] = data[key]
+				})
+			})
+		}, { localStorage: sysdata('local_storage'), sessionStorage: sysdata('session_storage') }, ALI_URLS)
 
 		//恢复cookie
 		const cookies = sysdata('cookie')
@@ -228,13 +275,32 @@ export class AliPanDriver {
 				const page = this.#page
 
 				await page.setRequestInterception(true);
-				page.on('request', request => request.continue());
+				page.on('request', request => {
+					request.continue({
+						headers: {
+							...request.headers(),
+							'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.5112.81 Safari/537.36 Edg/104.0.1293.47'
+						}
+					})
+				});
 
 				page.on('response', async response => {
 					const url = new URL(response.url())
 
+					//用户信息获取完成，表示就绪
+					if (ALI_URLS.is(url, 'USER_INFO')) {
+						this.#pageReady = true
+						this.#pageReadyFuncs.forEach(f => f())
+						this.#pageReadyFuncs.splice(0)
+						this.fire('ready')
+					}
+					//登录页
+					else if (ALI_URLS.is(url, 'LOGIN')) {
+						this.#isLogin = false
+						this.fire('login', false)
+					}
 					//登录二维码
-					if (ALI_URLS.is(url, 'QRCODE_GEN')) {
+					else if (ALI_URLS.is(url, 'QRCODE_GEN')) {
 						const qr = JSON.parse(await response.text())
 
 						const cp = Deno.run({
@@ -290,18 +356,25 @@ export class AliPanDriver {
 
 					const loader = async () => {
 						const url = this.pageURL
-						if (!url) return page.goto(`https://www.aliyundrive.com/sign/in`)
-						else if (ALI_URLS.is(url, 'LOGOUT')) return page.goto(`https://www.aliyundrive.com/sign/in`)
-						else return page.reload()
+						if (!url) {
+							this.fire('load', ALI_URLS.urls.LOGIN)
+							return page.goto(ALI_URLS.urls.LOGIN)
+						}
+						else if (ALI_URLS.is(url, 'LOGOUT')) {
+							this.fire('load', ALI_URLS.urls.LOGIN)
+							return page.goto(ALI_URLS.urls.LOGIN)
+						}
+						else {
+							this.fire('load', page.url())
+							return page.reload()
+						}
 					}
+					this.#pageReady = false
 
-					console.log('正在加载页面')
 					loader().then(() => {
-						console.log('页面加载成功，3分钟后刷新页面')
 						clearReloadTimeout()
-						reloadTimeout = setTimeout(() => load_page(), 1000 * 60 * 3);
+						reloadTimeout = setTimeout(() => load_page(), 1000 * (this.#option.refreshTimeout ?? 60 * 10));
 					}).catch(err => {
-						console.log('页面加载失败，正在重新加载...')
 						clearReloadTimeout()
 						reloadTimeout = setTimeout(() => load_page(), 10000)
 					})
@@ -312,6 +385,7 @@ export class AliPanDriver {
 					if (ALI_URLS.is(this.pageURL!, 'HOME')) {
 						clearInterval(loginTimer)
 						this.#isLogin = true
+						this.fire('login', true)
 						this.#qrcode = null
 						resolve()
 					}
@@ -338,20 +412,24 @@ export class AliPanDriver {
 	 * @param dirname 目录路径
 	 */
 	public async files(dirname: string) {
+		//没有登录，返回登录二维码以及屏幕截图
 		if (!this.#isLogin) {
 			if (dirname == '/') return [this.#systemFiles.screen!, this.#systemFiles.qrcode!].filter(f => !!f)
 			return []
 		}
+		//在控制中心目录下
 		if (dirname == `/${SystemFileName.Control}`) return this.#systemFiles.controlFiles
 
+		//其他的表示阿里云盘文件
+		this.#checkLogin()
+		await this.#waitReady()
 		const dirId = await this.#getDirectoryId(dirname)
 		if (!dirId) throw new Error(`Directory "${dirname}" Not Exists`)
 		const files = await this.#getFiles(dirId, false)
 		this.#lastData = { dir: dirname, files }
-
 		this.#setDirCache(files, dirname)
 
-		//根目录的时候加入回收站
+		//根目录的时候加入控制中心
 		if (dirname == '/') {
 			const recycle = this.#systemFiles.control
 			if (recycle) files.unshift(recycle)
@@ -364,12 +442,15 @@ export class AliPanDriver {
 	 * 获取回收站下的文件
 	 */
 	public async getRecycleBinFiles() {
+		this.#checkLogin()
+		await this.#waitReady()
+
 		const files = await this.#page.evaluate(async function (biz: IBizInfo) {
 			const files: Array<IAliFile> = []
 
 			let marker = ''
 			while (true) {
-				const res = await fetch(`https://api.aliyundrive.com/adrive/v2/recyclebin/list`, {
+				const res = await fetch(ALI_URLS.api.GET_RECYCLE_BIN, {
 					method: 'post',
 					headers: {
 						'authorization': `Bearer ${biz.accessToken}`,
@@ -414,6 +495,9 @@ export class AliPanDriver {
 	 * @param pathname 文件路径
 	 */
 	public async info(pathname: string) {
+		this.#checkLogin()
+		await this.#waitReady()
+
 		const { pdir, base } = await this.#checkParent(pathname)
 
 		//缓存得有，直接读取
@@ -439,6 +523,10 @@ export class AliPanDriver {
 		//控制中心
 		if (pathname == `/${SystemFileName.Control}`) return true
 		//其他的查找
+		if (pathname != '/') {
+			this.#checkLogin()
+			await this.#waitReady()
+		}
 		const id = await this.#getDirectoryId(pathname)
 		return !!id
 	}
@@ -448,10 +536,12 @@ export class AliPanDriver {
 	 * @param pathname 路径名称
 	 */
 	public async mkdir(pathname: string) {
+		this.#checkLogin()
+		await this.#waitReady()
 		const { pdir, base, pdirId } = await this.#checkParent(pathname)
 
 		await this.#page.evaluate(function (biz: IBizInfo, parent, name) {
-			return fetch(`https://api.aliyundrive.com/adrive/v2/file/createWithFolders`, {
+			return fetch(ALI_URLS.api.CREATE_FOLDER, {
 				method: 'post',
 				body: JSON.stringify({
 					check_name_mode: "refuse",
@@ -475,11 +565,13 @@ export class AliPanDriver {
 	 * @returns 上传信息
 	 */
 	public async preUpload(pathname: string) {
+		this.#checkLogin()
+		await this.#waitReady()
 		const { pdir, base, pdirId } = await this.#checkParent(pathname)
 
 		//创建文件
 		const res = await this.#page.evaluate(function (biz: IBizInfo, parent, name) {
-			return fetch(`https://api.aliyundrive.com/adrive/v2/file/createWithFolders`, {
+			return fetch(ALI_URLS.api.PRE_UPLOAD, {
 				method: 'post',
 				body: JSON.stringify({
 					check_name_mode: "overwrite",
@@ -530,12 +622,15 @@ export class AliPanDriver {
 	 * @returns 下载信息
 	 */
 	public async getDownloadURL(pathname: string) {
+		this.#checkLogin()
+		await this.#waitReady()
+
 		const file = await this.info(pathname).catch(err => null)
 		if (!file) throw new Error(`File ${pathname} not exists`)
 		if (file.type != 'file') throw new Error(`${pathname} is not a valid file`)
 
 		const res = await this.#page.evaluate(function (biz: IBizInfo, file: string) {
-			return fetch(`https://api.aliyundrive.com/v2/file/get_download_url`, {
+			return fetch(ALI_URLS.api.GET_DOWNLOAD, {
 				method: 'post',
 				body: JSON.stringify({ drive_id: biz.defaultDriveId, file_id: file }),
 				headers: {
@@ -566,6 +661,8 @@ export class AliPanDriver {
 	 * @param pathname 路径
 	 */
 	public async exists(pathname: string) {
+		this.#checkLogin()
+		await this.#waitReady()
 		return this.info(pathname).then(v => !!v).catch(e => false)
 	}
 
@@ -574,13 +671,15 @@ export class AliPanDriver {
 	 * @param pathname 路径
 	 */
 	public async trash(pathname: string) {
+		this.#checkLogin()
+		await this.#waitReady()
 
 		const file = await this.info(pathname)
 		if (!file) throw new Error(`File ${file} not exists`)
 
 		//删除
 		await this.#page.evaluate(function (biz: IBizInfo, id: string) {
-			return fetch(`https://api.aliyundrive.com/v2/recyclebin/trash`, {
+			return fetch(ALI_URLS.api.MOVE_TO_TRASH, {
 				method: 'post',
 				body: JSON.stringify({ drive_id: biz.defaultDriveId, file_id: id }),
 				headers: {
@@ -596,11 +695,14 @@ export class AliPanDriver {
 	 * @param pathname 路径
 	 */
 	public async batch(pathname: string) {
+		this.#checkLogin()
+		await this.#waitReady()
+
 		const file = await this.info(pathname)
 		if (!file) throw new Error(`File ${file} not exists`)
 
 		await this.#page.evaluate(function (biz: IBizInfo, file: IAliFile) {
-			fetch(`https://api.aliyundrive.com/v3/batch`, {
+			fetch(ALI_URLS.api.DELETE_FILE, {
 				method: 'post',
 				headers: {
 					'authorization': `Bearer ${biz.accessToken}`,
@@ -630,8 +732,11 @@ export class AliPanDriver {
 	 * @param name 文件名称
 	 */
 	public async rename(id: string, name: string) {
+		this.#checkLogin()
+		await this.#waitReady()
+
 		await this.#page.evaluate(function (biz: IBizInfo, id, name) {
-			return fetch(`https://api.aliyundrive.com/v3/file/update`, {
+			return fetch(ALI_URLS.api.RENAME_FILE, {
 				method: 'post',
 				headers: {
 					'authorization': `Bearer ${biz.accessToken}`,
@@ -657,10 +762,11 @@ export class AliPanDriver {
 
 	/** 清空回收站 */
 	public async clearRecycleBin() {
-		if (!this.#isLogin) throw new Error('Login First')
+		this.#checkLogin()
+		await this.#waitReady()
 
 		await this.#page.evaluate(function (biz: IBizInfo) {
-			return fetch(`https://api.aliyundrive.com/v2/recyclebin/clear`, {
+			return fetch(ALI_URLS.api.CLEAR_RECYCLE_BIN, {
 				method: 'post',
 				headers: {
 					'authorization': `Bearer ${biz.accessToken}`,
@@ -675,10 +781,11 @@ export class AliPanDriver {
 	 * 获取空间使用情况
 	 */
 	public async getSpaceUsage() {
-		if (!this.#isLogin) throw new Error(`Login first`)
+		this.#checkLogin()
+		await this.#waitReady()
 
 		const result = await this.#page.evaluate(function (biz: IBizInfo) {
-			return fetch(`https://api.aliyundrive.com/adrive/v1/user/driveCapacityDetails`, {
+			return fetch(ALI_URLS.api.GET_STORAGE_INFO, {
 				method: 'post',
 				headers: {
 					'authorization': `Bearer ${biz.accessToken}`,
@@ -767,7 +874,7 @@ export class AliPanDriver {
 						key: 'logout', name: '注销登录.txt',
 						size: () => 8,
 						data: () => `已注销当前账号`,
-						action: () => that.#page.goto(`https://www.aliyundrive.com/sign/out`),
+						action: () => that.#page.goto(ALI_URLS.urls.LOGOUT),
 					},
 					{
 						key: 'recycle_clear', name: '清空回收站.txt',
@@ -820,6 +927,12 @@ export class AliPanDriver {
 		}
 	}
 
+	//等待页面加载完成
+	async #waitReady() {
+		if (this.#pageReady) return
+		return new Promise<void>(resolve => this.#pageReadyFuncs.push(resolve))
+	}
+
 	/**
 	 * 获取当前目录下的文件列表
 	 * @param skipWhenFile 是否在读取到目录的时候跳过，在只获取目录的时候使用
@@ -830,7 +943,7 @@ export class AliPanDriver {
 			const files: Array<IAliFile> = []
 
 			while (true) {
-				const res = await fetch(`https://api.aliyundrive.com/adrive/v3/file/list`, {
+				const res = await fetch(ALI_URLS.api.LIST_FILES, {
 					method: 'post',
 					body: JSON.stringify({
 						all: false,
@@ -869,8 +982,7 @@ export class AliPanDriver {
 					})
 					if (finish) break
 				} catch (err) {
-					console.log(res)
-					console.log(res)
+					console.log(JSON.stringify(res))
 					throw err
 				}
 
@@ -929,6 +1041,10 @@ export class AliPanDriver {
 			++index
 		}
 		return `${bytes.toFixed(2)} ${unit[index]}`
+	}
+
+	#checkLogin() {
+		if (!this.#isLogin) throw new Error('Need Login first')
 	}
 
 }
