@@ -1,7 +1,7 @@
 /**
  * TO build this util, run
  * 
- * 		deno compile --allow-all  demo/ftp/aliyun-ftp.ts
+ * 		deno compile --allow-all --unstable demo/ftp/aliyun-ftp.ts
  * 
  */
 

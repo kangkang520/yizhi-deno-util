@@ -1,6 +1,7 @@
 import * as path from 'https://deno.land/std@0.151.0/path/mod.ts'
 import { readerFromStreamReader, readAll } from "https://deno.land/std@0.93.0/io/mod.ts";
 import puppeteer from "https://deno.land/x/puppeteer@14.1.1/mod.ts"
+import 'https://deno.land/x/puppeteer@14.1.1/install.ts'
 
 type Browser = Awaited<ReturnType<typeof puppeteer.launch>>
 type Page = Awaited<ReturnType<Browser['newPage']>>
@@ -117,17 +118,64 @@ export class AliPanDriver {
 	}
 
 	/** 初始化 */
-	public async init() {
+	public async init(): Promise<void> {
 		const home = Deno.env.get('HOME')!
-		console.log(home)
+		//读取，保存系统数据
+		const sysdata = (file: string, data?: any) => {
+			const filepath = path.join(home, '.aliftp', file + '.json')
+			if (data === undefined) {
+				try {
+					return JSON.parse(Deno.readTextFileSync(filepath))
+				} catch (err) {
+					return null
+				}
+			}
+			else {
+				Deno.mkdirSync(path.dirname(filepath), { recursive: true })
+				Deno.writeTextFileSync(filepath, JSON.stringify(data))
+			}
+		}
+
 		const browser = await puppeteer.launch({
-			userDataDir: path.join(home, '.yizhi', 'aliftp', 'ChromeData'),
+			args: ['--no-sandbox'],
+			// userDataDir: path.join(home, '.aliftp', 'ChromeData'),
 			defaultViewport: { width: 1920, height: 1080 },
 		});
 		browser.on('error', err => console.error(err))
 
 		this.#page = await browser.newPage();
+		this.#page.on('error', err => console.error(err))
+		this.#page.on('console', e => console.log(`[Console] ${e.text()}`))
 
+		//定义一个函数用来保存storage和cookie
+		await this.#page.exposeFunction('saveStorage', (storage: { localStorage: any, sessionStorage: any }) => {
+			console.log('storage changed')
+			sysdata('local_storage', storage.localStorage)
+			sysdata('session_storage', storage.sessionStorage)
+			this.#page.cookies().then(cookies => sysdata('cookie', cookies))
+		})
+
+		//恢复storage，同时定时报告storage信息
+		await this.#page.evaluateOnNewDocument(function (s: { localStorage: any, sessionStorage: any }) {
+			//设置localstorage和sessionstorage
+			Object.keys(s).forEach(storage => {
+				const data = (s as any)[storage]
+				if (!data) return
+				Object.keys(data).forEach(key => {
+					(window as any)[storage][key] = data[key]
+				})
+			})
+			//监听storage改变
+			window.addEventListener('storage', (e: any) => {
+				(window as any).saveStorage({ localStorage, sessionStorage })
+			})
+		}, { localStorage: sysdata('local_storage'), sessionStorage: sysdata('session_storage') })
+
+		//恢复cookie
+		const cookies = sysdata('cookie')
+		if (cookies?.length) await this.#page.setCookie(...cookies)
+
+		//开始登录
 		this.login().then(async () => {
 			this.#biz = await this.#getBiz()
 
@@ -135,10 +183,7 @@ export class AliPanDriver {
 			const CACHE_LVE_TIME = this.#option.cacheTime ?? 60 * 5
 			setInterval(() => {
 				Object.keys(this.#dirCache).forEach(key => {
-					if (this.#dirCache[key].time + CACHE_LVE_TIME < sec()) {
-						console.log(`[清理] ${key}`)
-						delete this.#dirCache[key]
-					}
+					if (this.#dirCache[key].time + CACHE_LVE_TIME < sec()) delete this.#dirCache[key]
 				})
 			}, 1000 * 10)
 
@@ -181,8 +226,6 @@ export class AliPanDriver {
 		return new Promise<void>(async (resolve, reject) => {
 			try {
 				const page = this.#page
-				page.on('error', err => console.error(err))
-				// page.on('console', e => console.log(`[Console] ${e.text()}`))
 
 				await page.setRequestInterception(true);
 				page.on('request', request => request.continue());
@@ -826,6 +869,7 @@ export class AliPanDriver {
 					})
 					if (finish) break
 				} catch (err) {
+					console.log(res)
 					console.log(res)
 					throw err
 				}
