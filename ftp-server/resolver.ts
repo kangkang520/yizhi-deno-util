@@ -1,13 +1,34 @@
 import { FTPConnection } from "./server.ts"
 
+/**
+ * 命令处理器选项
+ */
 export interface ICommandResolverOption {
+	/** FTP连接 */
 	conn: FTPConnection
+	/** 是否输出命令日志 */
 	debug: boolean
 }
 
-export class CommandResolver<OPT extends ICommandResolverOption> {
+/** 
+ * 命令处理器 
+ * 
+ * 此类需要被继承，并且实现响应的ftp命令。
+ * 
+ * ftp命令以小写字母的形式作为函数名称，例如：
+ * ```
+ * public async list(opt){
+ * 	//your code
+ * }
+ * ```
+ */
+export abstract class CommandResolver<OPT extends ICommandResolverOption> {
 	protected _option: OPT
 
+	/**
+	 * 命令处理器
+	 * @param option 命令处理器选项
+	 */
 	constructor(option: OPT) {
 		this._option = option
 	}

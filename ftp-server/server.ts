@@ -5,8 +5,11 @@ const CONN_READ_BYTES = 4096
 
 /** 地址信息 */
 export interface IAddr {
+	/** 主机地址 */
 	hostname: string
+	/** 端口号 */
 	port: number
+	/** 传输类型，只会是"tcp" */
 	transport: 'tcp' | 'udp'
 }
 
@@ -169,10 +172,17 @@ export class FTPServer extends EventEmitter<{
 	connection: (conn: FTPConnection) => any
 	error: (err: Error) => any
 }> {
+	/**
+	 * 创建FTP服务器
+	 */
 	constructor() {
 		super()
 	}
 
+	/**
+	 * 开始监听
+	 * @param option 监听选项 
+	 */
 	listen(option: Deno.ListenOptions) {
 		//开始监听
 		let server: Deno.Listener
